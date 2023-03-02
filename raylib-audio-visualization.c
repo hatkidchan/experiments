@@ -1,4 +1,4 @@
-// x-run: ~/scripts/runc.sh % -lraylib -ltcc -lm --- mushrooms.c
+// x-run: ~/scripts/runc.sh % -lraylib -ltcc -lm -lpthread --- mushrooms.c
 #include <math.h>
 #include <raylib.h>
 #include <raymath.h>
@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <libtcc.h>
 #include <assert.h>
+#include <pthread.h>
 #include <sys/types.h>
 #define STB_DS_IMPLEMENTATION
 #include <stb/stb_ds.h>
@@ -14,6 +15,7 @@
 
 #define BUFFER_SIZE 2048
 #define SAMPLE_RATE 192000
+#define MEMORY_SIZE 65536
 
 typedef void (*soundgen_fun_t)(double t, double dt, float *l, float *r);
 
@@ -29,12 +31,17 @@ static struct generator {
   soundgen_fun_t func;
   struct input_param *params;
   char **errors; // TODO: make use of it
-} generator;
+  uint8_t *memory;
+  size_t mem_used;
+  pthread_mutex_t mem_mutex;
+} generator = {
+  .mem_mutex = PTHREAD_MUTEX_INITIALIZER
+};
 
 static int width = 800, height = 600;
 static float samples_buffer[BUFFER_SIZE * 2];
 off_t samples_offset = 0;
-double time = 0.0l;
+double global_time = 0.0l;
 
 void soundgen_thread(short *buf, unsigned int frames);
 bool compile_generator(const char *contents);
@@ -114,47 +121,74 @@ int main(int argc, char **argv) {
       for (; generator.params[n_params].value; n_params++) ;
 
       if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_C)) {
-        int buf_size = (sizeof(double) + 16 + 8) * n_params, compr_size, b64_size;
-        struct {
-          char name[16];
-          double value;
-          uint8_t dummy[8];
-        } *buffer = MemAlloc(buf_size);
-        for (int i = 0; generator.params[i].value; i++) {
-          strncpy(buffer[i].name, generator.params[i].name, 16);
-          buffer[i].value = *generator.params[i].value;
-        }
-
-        uint8_t *compressed = CompressData((void*)buffer, buf_size, &compr_size);
-        MemFree(buffer);
-
-        char *b64 = EncodeDataBase64(compressed, compr_size, &b64_size);
-        MemFree(compressed);
-        b64[b64_size] = '\0';
-
-        SetClipboardText(TextFormat("OSCI#%s", b64));
-        MemFree(b64);
-      }
-
-      if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_V)) {
-        int compr_size, data_size;
-        const char *clip = GetClipboardText();
-        if (0 == strncmp(clip, "OSCI#", 5)) {
-          uint8_t *compressed = DecodeDataBase64((uint8_t*)clip + 5, &compr_size);
+        if (IsKeyDown(KEY_LEFT_SHIFT)) {
+          int b64_size;
+          char *b64 = EncodeDataBase64(generator.memory, generator.mem_used, &b64_size);
+          SetClipboardText(b64);
+          MemFree(b64);
+        } else {
+          int buf_size = (sizeof(double) + 16 + 8) * n_params, compr_size, b64_size;
           struct {
             char name[16];
             double value;
             uint8_t dummy[8];
-          } *buffer = (void *)DecompressData(compressed, compr_size, &data_size);
+          } *buffer = MemAlloc(buf_size);
+          for (int i = 0; generator.params[i].value; i++) {
+            strncpy(buffer[i].name, generator.params[i].name, 16);
+            buffer[i].value = *generator.params[i].value;
+          }
+
+          uint8_t *compressed = CompressData((void*)buffer, buf_size, &compr_size);
+          MemFree(buffer);
+
+          char *b64 = EncodeDataBase64(compressed, compr_size, &b64_size);
           MemFree(compressed);
-          for (int i = 0; i < data_size / sizeof(buffer[0]); i++) {
-            for (int j = 0; j < n_params; j++) {
-              if (0 == strncmp(buffer[i].name, generator.params[j].name, 16)) {
-                generator.params[j].target = buffer[i].value;
+          b64[b64_size] = '\0';
+
+          SetClipboardText(TextFormat("OSCI#%s", b64));
+          MemFree(b64);
+        }
+      }
+
+      if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_V)) {
+        if (IsKeyDown(KEY_LEFT_SHIFT)) {
+          const char *clip = GetClipboardText();
+          int size;
+          uint8_t *mem = DecodeDataBase64((uint8_t*)clip, &size);
+
+          pthread_mutex_lock(&generator.mem_mutex);
+
+          memcpy(generator.memory, mem, size > MEMORY_SIZE ? MEMORY_SIZE : size);
+
+          generator.func = tcc_get_symbol(generator.tcc, "generate");
+          assert(generator.func != NULL);
+
+          generator.params = tcc_get_symbol(generator.tcc, "params");
+          assert(generator.params != NULL);
+
+          pthread_mutex_unlock(&generator.mem_mutex);
+
+          MemFree(mem);
+        } else {
+          int compr_size, data_size;
+          const char *clip = GetClipboardText();
+          if (0 == strncmp(clip, "OSCI#", 5)) {
+            uint8_t *compressed = DecodeDataBase64((uint8_t*)clip + 5, &compr_size);
+            struct {
+              char name[16];
+              double value;
+              uint8_t dummy[8];
+            } *buffer = (void *)DecompressData(compressed, compr_size, &data_size);
+            MemFree(compressed);
+            for (int i = 0; i < data_size / sizeof(buffer[0]); i++) {
+              for (int j = 0; j < n_params; j++) {
+                if (0 == strncmp(buffer[i].name, generator.params[j].name, 16)) {
+                  generator.params[j].target = buffer[i].value;
+                }
               }
             }
+            MemFree(buffer);
           }
-          MemFree(buffer);
         }
       }
 
@@ -257,6 +291,9 @@ bool compile_generator(const char *code) {
   if (generator.tcc != NULL)
     tcc_delete(generator.tcc);
 
+  if (generator.memory != NULL)
+    free(generator.memory);
+
   if (generator.errors != NULL) {
     for (int i = 0; i < arrlen(generator.errors); i++)
       free(generator.errors[i]);
@@ -266,23 +303,38 @@ bool compile_generator(const char *code) {
   if ((generator.tcc = tcc_new()) == NULL)
     return false;
 
+  pthread_mutex_lock(&generator.mem_mutex);
+  generator.memory = malloc(MEMORY_SIZE);
+
   tcc_set_output_type(generator.tcc, TCC_OUTPUT_MEMORY);
 
   tcc_set_error_func(generator.tcc, NULL, tcc_error_callback);
 
   tcc_add_library(generator.tcc, "m");
 
-  if (-1 == tcc_compile_string(generator.tcc, code))
+  if (-1 == tcc_compile_string(generator.tcc, code)) {
+    pthread_mutex_unlock(&generator.mem_mutex);
     return false;
+  }
 
-  if (-1 == tcc_relocate(generator.tcc, TCC_RELOCATE_AUTO))
+  if ((generator.mem_used = tcc_relocate(generator.tcc, NULL)) > MEMORY_SIZE) {
+    pthread_mutex_unlock(&generator.mem_mutex);
+    tcc_error_callback(NULL, "Not enough memory");
     return false;
+  }
+
+  memset(generator.memory, 0, MEMORY_SIZE);
+  if (-1 == tcc_relocate(generator.tcc, generator.memory)) {
+    pthread_mutex_unlock(&generator.mem_mutex);
+    return false;
+  }
 
   generator.func = tcc_get_symbol(generator.tcc, "generate");
   assert(generator.func != NULL);
   generator.params = tcc_get_symbol(generator.tcc, "params");
   assert(generator.params != NULL);
 
+  pthread_mutex_unlock(&generator.mem_mutex);
   return true;
 }
 
@@ -294,6 +346,7 @@ void tcc_error_callback(void *opaque, const char *error) {
 void soundgen_thread(short *buf, unsigned int frames) {
   float l, r;
 
+  pthread_mutex_lock(&generator.mem_mutex);
   for (int i = 0; i < frames; i++) {
     for (int j = 0; generator.params[j].value; j++) {
       struct input_param param = generator.params[j];
@@ -302,13 +355,14 @@ void soundgen_thread(short *buf, unsigned int frames) {
       }
     }
 
-    generator.func(time, 1.0l / SAMPLE_RATE, &l, &r);
+    generator.func(global_time, 1.0l / SAMPLE_RATE, &l, &r);
     samples_buffer[(i * 2 + 0 + samples_offset) % (BUFFER_SIZE * 2)] = l;
     samples_buffer[(i * 2 + 1 + samples_offset) % (BUFFER_SIZE * 2)] = r;
     buf[i * 2 + 0] = l * 32767.0f;
     buf[i * 2 + 1] = r * 32767.0f;
-    time += 1.0l / SAMPLE_RATE;
+    global_time += 1.0l / SAMPLE_RATE;
   }
+  pthread_mutex_unlock(&generator.mem_mutex);
 
   if (file_out != NULL) {
     fwrite(buf, sizeof(short) * 2, frames, file_out);

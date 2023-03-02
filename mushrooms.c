@@ -53,10 +53,7 @@ double square(double dt) {
   return sin(dt) < 0.0 ? -1.0 : 1.0;
 }
 
-static double lfo_phase = 0.0l;
 void generate(double t, double dt, float *l, float *r) {
-  /*lfo_phase  += M_PI * 2.0 * dt * 0.1;*/
-  /*params[0].target = sin(lfo_phase) * 1000.0l + 3000.0l;*/
   scan_phase += M_PI * 2.0 * dt * freq * scan_freq_mul;
   stem_phase += M_PI * 2.0 * dt * freq * stem_freq_mul;
   hat_phase  += M_PI * 2.0 * dt * freq * hat_freq_mul;
